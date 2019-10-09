@@ -445,8 +445,7 @@ static unsigned long  user_unwind_stack_by_address(unsigned long stack_page,
 		return 0;
 	}
 	/*
-	!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!核心理解理解!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-	!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+	!!!!!!!!!!!!!!!!!!!核心理解!!!!!!!!!!!!!!!!!!!!!!!!
 	应用崩溃在库函数里，这个if是关键。以test_a执行memcpy为例，先执行memcpy@plt函数，注意这个memcpy@plt是编译链接是自动生成，跟test_a函数在一起，反汇编就能看到，是执行实际库函数的跳板。这个函数的指令首地址是0x4013b0，test_a函数指令首地址是0x400858,在memcpy@plt函数中指令内存中，从0x411408内存地址获取c库的memcpy的指令首地址0x779b4910，readelf -a dump_stack看PLT GOT段内容，再结合反回编的汇编代码看看。然后程序就跳转到0x779b4910内存单元执行真实的C库函数memcpy，0x779b4910就在C库函数的maps的指令段。注意，注意，这个跳转过程没有看到addiu sp,sp.-152指令分配栈空间的指令，也没有看到sw ra,148(sp)把函数返回地址保存到函数栈最后的指令。相当于库函数memcpy的执行情况跟我测试的test_a_一样，没有执行其他函数，就不会分配栈空间和保存ra值到栈中,实际观察memcpy汇编代码，确实没有执行其他函数。所以memcpy函数中崩溃了，就直接使用ra寄存器的值了，ra就是memcpy的函数返回地址，就是test_a函数指令中调用memcpy@plt函数那条指令的下一条指令地址，之后就返回test_a函数了。C库好多函数都没有addiu sp,sp,-152和sw ra,148(sp)类似指令，分析这些函数得注意，这些函数中就没有调用其他函数，只能使用ra寄存器的值，推算该函数的返回地址。
 	*/
 	if (leaf)
@@ -457,27 +456,9 @@ static unsigned long  user_unwind_stack_by_address(unsigned long stack_page,
 		 * one. In that cases avoid to return always the
 		 * same value.
 		 */
-/*
-我又脑残了，我想的太多了，根本不用从用户空间复制ra值，因为崩溃时，系统已经把应用崩溃时的ra寄存器值保存到struct pt_regs里，这里直接获取ra寄存器的值作为函数返回地址，*ra就是ra寄存器的值，脑子当时短路了
 
-我发现牵涉到用户空间指针、内核空间变量、内核空间函数内指针的问题，很容易分析错，这不是第一次了!!!!!唯一的解决方法就是举例子，化抽象为实体。
-*/
-#if 0
-		 //这里也要使用get_user复制ra
-		//pc = pc != *ra ? *ra : 0;
-		unsigned long tmp;
-
-		printk("%s leaf not find ra instruction\n",__func__);
-		if(get_user(tmp,ra))
-		{
-		    printk(KERN_ERR"%s leaf get_user error\n",__func__);
-		    return 0;
-		}
-        pc = pc != tmp ? tmp : 0;
-#else
-//我又绕晕头了，本质是:这个ra诗歌内核态指针，它指向内核变量struct pt_regs结构体里的ra1变量，值是0x7fff0000，是个用户空间的指令地址，现在要得到ra1变量的数据0x7fff0000，*ra就行了，因为ra指针指向ra1，*ra就是指针指向的变量内存里的数据
+//本质是:这个ra是个内核态指针，它指向内核变量struct pt_regs结构体里的ra1变量，值是0x7fff0000，是个用户空间的指令地址，现在要得到ra1变量的数据0x7fff0000，*ra就行了，因为ra指针指向ra1，*ra就是指针指向的变量内存里的数据
 	    pc = pc != *ra ? *ra : 0;
-#endif
     }
 	else
 	{
@@ -494,18 +475,7 @@ static unsigned long  user_unwind_stack_by_address(unsigned long stack_page,
 	//有一个理解上的很大误区，sp指向栈空间，*sp不就是对指针指向的栈空间赋值???????没传过来弯道.*p就是操作指针指向的空间
 	*sp += info.frame_size;
     *ra = 0; 
-	
-	/*我被绕晕了，这里的sp是个内核空间的指针，指向上一个函数的变量sp1,其内存中数据0x7fff0000,表示栈地址数据，现在是实现sp1自加info.frame_size，
-	要么是sp1+= info.frame_size,要么是*sp += info.frame_size，因为*sp就是sp1，这只是个再简单不过的c语言指针问题，但是在这个场景里，*sp+=2实现指针
-	指向的内存中数据的加加减减，不是为啥想不通，竟然要用get_user操作!!!!!!!!!!!!!*/
-	//if(get_user(tmp,sp))
-	//    return 0;
-	//tmp += info.frame_size;	
-    //put_user(tmp,sp);     
-    //put_user(0,ra);
-	
-	///question! 1///////////////////////////////////////////////////这里最好是判断pc是否是用户空间指令，哎，这点又得想办法搞定，先永ok吧
-	//return __kernel_text_address(pc) ? pc : 0;
+
 	return pc;
 }
 /** user_unwind_stack - 根据当前函数的pc值，计算出上一级函数的栈顶地址和当前函数的返回地址
@@ -685,7 +655,7 @@ static void show_user_backtrace(struct task_struct *task, const struct pt_regs *
 		else//在库函数代码段
 		{
 		    //根据可执行程序文件和lib库文件的.dynstr和.dynsym信息分析出库函数的运行地址和库函数原始的偏差值
-	        ret = get_lib_fun_offset(&elf_lib_info,%lib_info);
+	        ret = get_lib_fun_offset(&elf_lib_info,&lib_info);
 	        if(ret)
 			{
 			    printk(KERN_ERR"%s get_lib_fun_offset:%d error\n",__func__,ret);
@@ -935,7 +905,7 @@ err:
 *     0:计算出库函数的实际运行首地址和原始首地址之差
 *    <0:没有计算库函数的实际运行首地址和原始首地址之差
 *
-*这个函数的功能详细描述：根据可执行程序的got段内存中存储的库函数strcmp运行地址got_lib_fun_val(假设got段第四片内存保存的数据是strcmp库函数的运行地址，got_lib_fun_val保存这个运行地址)，然后在lib库文件中，.dynstr段搜索函数名字字符串是"strcmp"的函数，而.dynsym段保存的数据————函数struct elf_sym结构与 .dynstr段的函数名字字符串也是一一对应的。
+*  note：根据可执行程序的got段内存中存储的库函数strcmp运行地址got_lib_fun_val(假设got段第四片内存保存的数据是strcmp库函数的运行地址，got_lib_fun_val保存这个运行地址)，然后在lib库文件中，.dynstr段搜索函数名字字符串是"strcmp"的函数，而.dynsym段保存的数据————函数struct elf_sym结构与 .dynstr段的函数名字字符串也是一一对应的。
    比如， 假如.dynstr 段的第一个函数名字字符串是 "strcmp"， .dynsym段的第一个struct elf_sym结构就是strcmp库函数的，该结构的st_value是strcmp库函数的俄原始地址，st_size是库函数的指令字节数。
    知道了strcmp库函数的运行地址got_lib_fun_val，又在lib库文件中.dynstr段找到了strcmp的字符串，同样的偏移找到了 .dynsym段strcmp库函数的struct elf_sym结构，就知道了它的原始函数地址st_value。got_lib_fun_val-st_value就是库函数的运行地址和原始地址的差值off，应该适用于所有库函数。之后我知道一个库函数的st_value，就知道了它的运行地址首地址st_value+off，函数指令结束地址end，那知道任何一个库函数中的崩溃地址pc， pc > st_value+off并且 pc < end时，就知道崩溃库函数指令pc处于哪个库函数了，当然也知道它的名字字符串。
    有一点需要注意，库函数的运行地址和原始地址的低12位数据是一样的，测试证实了这一点，我觉得这与PAGE_SIZE是2的12次方有关。
@@ -1112,7 +1082,7 @@ static int get_lib_fun_info(struct Sym_Fun_Info * sym_lib_info,struct Elf_Lib_In
             memcpy(&user_stack_unwind.sym_info,sym_lib_info,sizeof(struct Sym_Fun_Info));
 
       #ifdef CONFIG_ARM64
-			printk(KERN_DEBUG"%s find %s first_fun_addr:0x%lx size:0x%llx  st_value:0x%llx\n",__func__,sym_lib_info->name,sym_lib_info->fun_first_instruct_addr,elf_lib_sym->st_size,elf_lib_sym->st_value);
+			printk(KERN_DEBUG"%s find %s first_fun_addr:0x%lx size:0x%llx  st_value:0x%llx\n",__func__,sym_lib_info->name,sym_lib_info->fun_first_instruct_addr,lib_sym->st_size,lib_sym->st_value);
 	  #else		
 			printk(KERN_DEBUG"%s find %s first_fun_addr:0x%lx size:0x%x  st_value:0x%x\n",__func__,sym_lib_info->name,sym_lib_info->fun_first_instruct_addr,lib_sym->st_size,lib_sym->st_value);
 	  #endif
@@ -1159,7 +1129,7 @@ static int get_elf_fun_info(struct Sym_Fun_Info * elf_sym_info,struct Elf_Lib_In
             memcpy(&user_stack_unwind.sym_info,elf_sym_info,sizeof(struct Sym_Fun_Info));
 
       #ifdef CONFIG_ARM64
-			printk(KERN_DEBUG"%s find %s first_fun_addr:0x%lx size:0x%llx  st_value:0x%llx\n",__func__,elf_sym_info->name,elf_sym_info->fun_first_instruct_addr,elf_lib_sym->st_size,elf_lib_sym->st_value);
+			printk(KERN_DEBUG"%s find %s first_fun_addr:0x%lx size:0x%llx  st_value:0x%llx\n",__func__,elf_sym_info->name,elf_sym_info->fun_first_instruct_addr,elf_fun_sym->st_size,elf_fun_sym->st_value);
 	  #else		
 			printk(KERN_DEBUG"%s find %s first_fun_addr:0x%lx size:0x%x  st_value:0x%x\n",__func__,elf_sym_info->name,elf_sym_info->fun_first_instruct_addr,elf_fun_sym->st_size,elf_fun_sym->st_value);
 	  #endif
@@ -1302,12 +1272,6 @@ int user_stack_backstrace(struct pt_regs *regs,struct task_struct *task)
 	}
     printk("%s size:%ld\n",elf_path_name,get_file_size(elf_file));
 	
-//?????????????????????????????????????????????????????????????????????????????????????????????????????????
-//我也是醉了，这个读库文民数据必须在上边open elf可执行程序函数后边，否则读库文件返回-12，权限问题，我也是醉了，这个问题得好好查查
-
-//如果崩溃在库中，读取库文件的数据
-/**********************************************************************************************/
-
 #ifdef CONFIG_MIPS
     addr = regs->cp0_epc;
 #else
