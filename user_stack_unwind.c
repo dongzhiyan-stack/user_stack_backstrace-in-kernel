@@ -2,7 +2,8 @@
 /*
 *  内核对异常应用栈回溯
 *
-*  hujunpeng dongzhiyan_linux@163.com
+*  author : hujunpeng 
+*  email  : dongzhiyan_linux@163.com
 */
 
 #include <linux/tick.h>
@@ -99,7 +100,7 @@ static int get_lib_fun_offset(struct elf_file_info *elf_info,struct elf_file_inf
 static int get_lib_fun_info(struct sym_fun_info * sym_lib_info,struct elf_file_info *lib_info,unsigned long addr,unsigned long lib_fun_offset);
 static int get_elf_fun_info(struct sym_fun_info * elf_sym_info,struct elf_file_info *elf_info,unsigned long addr);
 
-#define OPEN_PRINT 1
+#define OPEN_PRINT 0
 #define user_stack_printk(fmt,...) \
     do{if(OPEN_PRINT) \
         printk(fmt,##__VA_ARGS__); \
@@ -918,8 +919,8 @@ static int get_lib_fun_offset(struct elf_file_info *elf_info,struct elf_file_inf
     lib_sym = (struct elf_sym *)lib_info->first_lib_sym;
     lib_fun_name = (char *)lib_info->elf_lib_fun_str;
 
-//调试可执行程序用到的库函数	
-#if 0
+//调试可执行程序用到的库函数信息
+#if OPEN_PRINT
 	//elf_info->section_dynsym.sh_size 是elf库文件.dynsym段总大小，除以struct elf_sym大小，就是库函数总数，一个函数信息用一个struct elf_sym结构表示
 	for(i = 0;i < elf_info->section_dynsym.sh_size/sizeof(struct elf_sym);i++)
 	{
@@ -1061,7 +1062,7 @@ static int get_lib_fun_info(struct sym_fun_info * sym_lib_info,struct elf_file_i
 			名字，但是对应同一个函数。但是gsignal会先搜索到，gdb此时栈回溯时打印的是raise函数，所以这里就不直接return 0，而是一直搜索，
 			使用最后找到的库函数*/
 	        ret = 0;
-            //return 0;
+            return 0;
          }
 
 		lib_sym ++;//指向下一个库函数struct elf_sym结构
@@ -1105,7 +1106,7 @@ static int get_elf_fun_info(struct sym_fun_info * elf_sym_info,struct elf_file_i
 			user_stack_printk(KERN_DEBUG"%s find %s first_fun_addr:0x%lx size:0x%x  st_value:0x%x\n",__func__,elf_sym_info->name,elf_sym_info->fun_first_instruct_addr,elf_fun_sym->st_size,elf_fun_sym->st_value);
 	  #endif
 	        ret = 0;
-            //return 0;
+            return 0;
         }
 
 		elf_fun_sym ++;//指向下一个函数struct elf_sym结构
