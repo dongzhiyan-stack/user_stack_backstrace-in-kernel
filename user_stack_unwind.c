@@ -1,3 +1,10 @@
+
+/*
+*  内核对异常应用栈回溯
+*
+*  hujunpeng dongzhiyan_linux@163.com
+*/
+
 #include <linux/tick.h>
 #include <linux/stddef.h>
 #include <linux/unistd.h>
@@ -53,13 +60,12 @@ struct sym_fun_info{
 	unsigned long fun_end_instruct_addr;
 };
 struct user_stack_unwind{
-    unsigned long sys_info_size;
 	unsigned long elf_text_start;
 	unsigned long elf_text_end;
 	unsigned long thread_stack_start;
-    struct list_head sym_head;
     struct sym_fun_info sym_info;
 	struct task_struct *thread;
+	struct mutex stack_backstrace_lock;
 };
 
 struct mips_frame_info {
@@ -79,8 +85,8 @@ struct elf_file_info{
 	unsigned char *elf_fun_str;//保存elf 可执行程序文件中.strtab section区数据，该数据区是一个个可执行程序函数名字字符串
 	
 	unsigned long *got_addr;//保存got段的内存首地址
-	unsigned long  elf_lib_fun_off;//库函数原始函数地址与实际运行地址的偏差
-	int elf_strip;//可执行程序stip过置1，否则为0
+	unsigned long  elf_lib_fun_off;//库函数原始首函数地址与实际运行首地址的之差
+	int elf_strip;//可执行程序strip过置1，否则为0
 };
 
 static struct elf_file_info elf_info,lib_info;
@@ -93,6 +99,11 @@ static int get_lib_fun_offset(struct elf_file_info *elf_info,struct elf_file_inf
 static int get_lib_fun_info(struct sym_fun_info * sym_lib_info,struct elf_file_info *lib_info,unsigned long addr,unsigned long lib_fun_offset);
 static int get_elf_fun_info(struct sym_fun_info * elf_sym_info,struct elf_file_info *elf_info,unsigned long addr);
 
+#define OPEN_PRINT 1
+#define user_stack_printk(fmt,...) \
+    do{if(OPEN_PRINT) \
+        printk(fmt,##__VA_ARGS__); \
+	}while(0)
 
 #ifdef CONFIG_MIPS
 #define elf_sym elf32_sym
@@ -208,7 +219,7 @@ static inline int is_sp_move_ins(union mips_instruction *ip)
 /**
 * user_process_lookup_size_offset - 根据传入的指令地址计算所处函数的指令字节数和该指令地址的偏移
 * @addr - 传入的指令地址
-* @symbolsize - 根据addr计算出的
+* @symbolsize - 根据addr计算出的函数指令字节数
 * @offset - addr相对函数指令首地址的偏移
 *
 * returns:
@@ -226,7 +237,7 @@ static int user_process_lookup_size_offset(unsigned long addr, unsigned long *sy
         ret = get_elf_fun_info(&sym_func_info,&elf_info,addr);
 	    if(ret)
 	    {
-	        printk("%s get_elf_fun_info:%d error\n",__func__,ret);
+	        user_stack_printk("%s get_elf_fun_info:%d error\n",__func__,ret);
 	        return 0;
 	    }
 	}
@@ -236,7 +247,7 @@ static int user_process_lookup_size_offset(unsigned long addr, unsigned long *sy
 	    ret = get_lib_fun_offset(&elf_info,&lib_info);
 	    if(ret)
 	    {
-	        printk("%s get_lib_fun_offset:%d error\n",__func__,ret);
+	        user_stack_printk("%s get_lib_fun_offset:%d error\n",__func__,ret);
 	        return 0;
 	    }
 		memset(&sym_func_info,0,sizeof(struct sym_fun_info));
@@ -250,7 +261,7 @@ static int user_process_lookup_size_offset(unsigned long addr, unsigned long *sy
 			碰到C库未知函数2，当然不知道该函数名字和指令首地址，那就直接return 0栈回溯结束，这就从原理上证实，mips架构double free
 			栈回溯存在问题，有时间研究一下"C库未知函数2"出现的原因。
 			*/
-	        printk("%s get_lib_fun_info:%d error\n",__func__,ret);
+	        user_stack_printk("%s get_lib_fun_info:%d error\n",__func__,ret);
 	        return 0;
 	    }
 	}
@@ -262,7 +273,7 @@ static int user_process_lookup_size_offset(unsigned long addr, unsigned long *sy
 }
 /**
 * get_frame_info - 根据传入的函数指令首地址，依次分析汇编指令，根据汇编指令找到函数栈大小和函数返回地址在栈中的保存位置
-* @info - info->func就是函数指令首地址，info->frame_size保存函数栈大小，info->pc_offset保存函数返回地址保存在函数栈中的偏移
+* @info - info->func就是函数指令首地址，info->frame_size保存函数栈大小，info->pc_offset保存函数返回地址在函数栈中的偏移
 *
 * returns:
 *    0：分析汇编指令后，找到函数栈大小和函数返回地址在栈中的保存位置
@@ -352,7 +363,7 @@ err:
 	return -1;
 }
 /** user_unwind_stack_by_address - 根据当前函数的pc值，计算出上一级函数的栈顶地址和当前函数的返回地址
-* @stack_page - 函数内核栈顶
+* @stack_page - 线程内核栈栈顶
 * @*sp - 保存上一级函数栈顶
 * @pc - 当前函数的pc值，就是栈回溯过程打印的函数地址
 * @*ra - 崩溃函数中没有调用其他函数时，是应用段错误当时的ra寄存数据，这种情况第一次栈回溯时使用
@@ -376,7 +387,7 @@ static unsigned long  user_unwind_stack_by_address(unsigned long stack_page,
 
 	if (!user_process_lookup_size_offset(pc, &size, &ofs))
 	{
-	    printk("%s can not find vaild user function at pc:0x%lx\n",__func__,pc);
+	    user_stack_printk("%s can not find vaild user function at pc:0x%lx\n",__func__,pc);
 		return 0;
 	}
 	/*
@@ -397,7 +408,7 @@ static unsigned long  user_unwind_stack_by_address(unsigned long stack_page,
     //判断sp是否超出当前进程的用户空间栈底
 	if(*sp + info.frame_size > user_stack_unwind_info.thread_stack_start)
 	{
-	    printk("%s expand user thread stack\n",__func__);
+	    user_stack_printk("%s expand user thread stack\n",__func__);
 		return 0;
 	}
 
@@ -499,7 +510,7 @@ static int instructions_belong_to_one_fun(struct elf_file_info *elf_info,unsigne
     //这里只判断pc1和pc2是否处于同一个可执行程序函数的情况，不判断是否处于同一个动态库函数的情况
     for(i = 0;i < elf_info->section_symtab.sh_size/sizeof(struct elf_sym);i++)
 	{
-        //elf_fun_sym->st_value 是lib库文件中每个库函数的默认函数首地址，elf_fun_sym->st_value + lib_fun_offset 是库函数重定向后的函数首地址
+        //elf_fun_sym->st_value 是可执行程序文件中每个函数的首地址
 	    if((pc1 >= elf_fun_sym->st_value) && (pc1 < elf_fun_sym->st_value + elf_fun_sym->st_size))
 		{
 			if((pc2 >= elf_fun_sym->st_value) && (pc2 < elf_fun_sym->st_value + elf_fun_sym->st_size))
@@ -529,7 +540,7 @@ static int user_unwind_frame(struct stackframe *frame)
 	//判断sp是否超出当前进程的用户空间栈底
 	if(frame->sp >= user_stack_unwind_info.thread_stack_start)
 	{
-	    printk("%s expand user thread stack\n",__func__);
+	    user_stack_printk("%s expand user thread stack\n",__func__);
 		return -EFAULT;
 	}
 	
@@ -609,18 +620,18 @@ static void show_user_backtrace(struct task_struct *task, const struct pt_regs *
 				ret = get_elf_fun_info(&sym_func_info,&elf_info,where);
 				if(ret)
 				{
-					printk("%s get_elf_fun_info:%d error\n",__func__,ret);
+					user_stack_printk("%s get_elf_fun_info:%d error\n",__func__,ret);
 					return;
 				}
 			}
 		}
 		else//在库函数代码段
 		{
-		    //根据可执行程序文件和lib库文件的.dynstr和.dynsym信息分析出库函数的运行地址和库函数原始的偏差值
+		    //根据可执行程序文件和lib库文件的.dynstr和.dynsym信息分析出库函数的运行首地址和库函数首原始的偏差值
 	        ret = get_lib_fun_offset(&elf_info,&lib_info);
 	        if(ret)
 			{
-			    printk("%s get_lib_fun_offset:%d error\n",__func__,ret);
+			    user_stack_printk("%s get_lib_fun_offset:%d error\n",__func__,ret);
 	            return;
 		    }
 		    memset(&sym_func_info,0,sizeof(struct sym_fun_info));
@@ -633,7 +644,7 @@ static void show_user_backtrace(struct task_struct *task, const struct pt_regs *
 				就找不到C库函数，此时get_lib_fun_info返回-1，但是不出错返回，继续栈回溯，最后能完整回溯到可执行程序代码段，gdb做不到。
 				arm64栈回溯使用fp寄存器定位函数栈，不依赖函数函数指令首地址，所以遇到未知C库函数，照样能栈回溯。
 				*/
-				printk("%s get_lib_fun_info:%d error\n",__func__,ret);
+				user_stack_printk("%s get_lib_fun_info:%d error\n",__func__,ret);
 	           //return 0;
 			}
 		}
@@ -684,7 +695,7 @@ static int  print_user_ip_sym(unsigned long pc)
 		return 1;
 	}
 	else 
-	    printk("cat not find valid user function\n");
+	    user_stack_printk("cat not find valid user function\n");
 	
 	return 0;
 }
@@ -741,7 +752,7 @@ static int read_elf_section_info(struct file *elf_file,struct elf_file_info *elf
 	//section_name 指向编号是elf_head->e_shstrndx的section的数据区首地址，这个section的数据各个section的名字字符串。p_section->sh_offset是该section对应的数据的偏移
     retval = kernel_read(elf_file,p_section->sh_offset,section_name,p_section->sh_size);
 	if (retval <= 0) {
-		printk("%s line:%d kernel_read fail\n",__func__,__LINE__);
+		user_stack_printk("%s line:%d kernel_read fail\n",__func__,__LINE__);
 		retval = -EIO;
 		goto err;
 	}
@@ -749,22 +760,22 @@ static int read_elf_section_info(struct file *elf_file,struct elf_file_info *elf
 	p_section = (struct elf_shdr *)section_data;
 	for(i = 0;i < elf_head.e_shnum;i++)
 	{
-	    //.dynsym 段
+	    //.dynsym 段   每个section 的 sh_name 是该section名字字符串的索引
 		if(/*SHT_SYMTAB == p_section->sh_type && */strcmp(".dynsym",&section_name[p_section->sh_name]) == 0)
 		{
 		    #ifdef CONFIG_ARM64
-			    printk("%s find ,section sh_offset:0x%llx sh_size:0x%llx\n",&section_name[p_section->sh_name],p_section->sh_offset,p_section->sh_size);
+			    user_stack_printk("%s find ,section sh_offset:0x%llx sh_size:0x%llx\n",&section_name[p_section->sh_name],p_section->sh_offset,p_section->sh_size);
 		    #else
-			    printk("%s find ,section sh_offset:0x%x sh_size:0x%x\n",&section_name[p_section->sh_name],p_section->sh_offset,p_section->sh_size);
+			    user_stack_printk("%s find ,section sh_offset:0x%x sh_size:0x%x\n",&section_name[p_section->sh_name],p_section->sh_offset,p_section->sh_size);
 		    #endif
 			    memcpy(&elf_info->section_dynsym,p_section,sizeof(struct elf_shdr));//保存.dynstr 段的信息
 			    elf_info->first_lib_sym = kmalloc(p_section->sh_size,GFP_KERNEL);//
 			    if(!elf_info->first_lib_sym)
                     goto err;
-			     //从dynsym段指定的文件偏移地址复制dynsym段的数据到 elf_info.first_lib_sym，这些数据就是struct elf_sym结构的集合，每一个struct elf32_sym结构代表一个库函数信息，包括该库函数名字符串索引、库函数默认运行地址、库函数指令字节数
+			     //从dynsym段指定的文件偏移地址复制dynsym段的数据到 elf_info.first_lib_sym，这些数据就是struct elf_sym结构的集合，每一个struct elf32_sym结构代表一个函数信息，包括该函数名字符串索引、函数默认运行地址、函数指令字节数
                 retval = kernel_read(elf_file,p_section->sh_offset,(unsigned char *)elf_info->first_lib_sym,p_section->sh_size);
 				if (retval <= 0) {
-					printk("%s line:%d kernel_read fail d\n",__func__,__LINE__);
+					user_stack_printk("%s line:%d kernel_read fail d\n",__func__,__LINE__);
 					retval = -EIO;
 					goto err;
 				}
@@ -773,38 +784,38 @@ static int read_elf_section_info(struct file *elf_file,struct elf_file_info *elf
 		else if(/*SHT_STRTAB == p_section->sh_type && */strcmp(".dynstr",&section_name[p_section->sh_name]) == 0)
 		{
 		    #ifdef CONFIG_ARM64
-			    printk("%s find ,section sh_offset:0x%llx sh_size:0x%llx\n",&section_name[p_section->sh_name],p_section->sh_offset,p_section->sh_size);
+			    user_stack_printk("%s find ,section sh_offset:0x%llx sh_size:0x%llx\n",&section_name[p_section->sh_name],p_section->sh_offset,p_section->sh_size);
 		    #else
-			    printk("%s find ,section sh_offset:0x%x sh_size:0x%x\n",&section_name[p_section->sh_name],p_section->sh_offset,p_section->sh_size);
+			    user_stack_printk("%s find ,section sh_offset:0x%x sh_size:0x%x\n",&section_name[p_section->sh_name],p_section->sh_offset,p_section->sh_size);
 		    #endif
 			    memcpy(&elf_info->section_dynstr,p_section,sizeof(struct elf_shdr));//保存.dynstr 段section结构
 			    elf_info->elf_lib_fun_str = kmalloc(p_section->sh_size,GFP_KERNEL);//
 			    if(!elf_info->elf_lib_fun_str)
                     goto err;
-			    //从dynstr段指定的文件偏移地址复制库函数字符串数据到 elf_info->elf_lib_fun_str
+			    //从dynstr段指定的文件偏移地址复制函数字符串数据到 elf_info->elf_lib_fun_str
                 retval = kernel_read(elf_file,p_section->sh_offset,elf_info->elf_lib_fun_str,p_section->sh_size);
 				if (retval <= 0) {
-			        printk("%s line:%d kernel_read fail d\n",__func__,__LINE__);
+			        user_stack_printk("%s line:%d kernel_read fail d\n",__func__,__LINE__);
 					retval = -EIO;
 				    goto err;
 				}
 		}
-		//.plt段，plt段是库函数跳转表，我们执行的printf库函数，是先跳转到这个段的printf@GLIBC_2.0 函数，然后跳转到got段函数表，这里是每个库函数的重定向后的函数指针，在这里运行到c库真实的printf函数
+		//.plt段，plt段是库函数跳转表，我们执行的printf库函数，是先跳转到这个段的printf@GLIBC_2.0 函数，然后跳转到got段函数表，这里是每个库函数的重定向后的函数首地址，在这里运行到c库真实的printf函数
 		else if(/*SHT_STRTAB == p_section->sh_type && */strcmp(".plt",&section_name[p_section->sh_name]) == 0)
 		{
 		    #ifdef CONFIG_ARM64
-		        printk("%s find ,section sh_addr:0x%llx sh_offset:0x%llx sh_size:0x%llx\n",&section_name[p_section->sh_name],p_section->sh_addr,p_section->sh_offset,p_section->sh_size);
+		        user_stack_printk("%s find ,section sh_addr:0x%llx sh_offset:0x%llx sh_size:0x%llx\n",&section_name[p_section->sh_name],p_section->sh_addr,p_section->sh_offset,p_section->sh_size);
 		    #else
-		        printk("%s find ,section sh_addr:0x%x sh_offset:0x%x sh_size:0x%x\n",&section_name[p_section->sh_name],p_section->sh_addr,p_section->sh_offset,p_section->sh_size);
+		        user_stack_printk("%s find ,section sh_addr:0x%x sh_offset:0x%x sh_size:0x%x\n",&section_name[p_section->sh_name],p_section->sh_addr,p_section->sh_offset,p_section->sh_size);
 		   #endif
 		}
-		//.got段，该段的sh_addr成员是程序运行后got段的用户空间内存地址，这片内存的数据是plt段库函数的重定向后库函数地址，真实库函数地址
+		//.got段，该段的sh_addr成员是程序运行后.got.plt段的用户空间内存地址，这片内存的数据是plt段库函数的重定向后库函数首地址
 		else if(/*SHT_STRTAB == p_section->sh_type && */strcmp(".got.plt",&section_name[p_section->sh_name]) == 0)
 		{
 		    #ifdef CONFIG_ARM64
-		        printk("%s find  sh_addr:0x%llx\n",&section_name[p_section->sh_name],p_section->sh_addr);
+		        user_stack_printk("%s find  sh_addr:0x%llx\n",&section_name[p_section->sh_name],p_section->sh_addr);
 		    #else
-		        printk("%s find  sh_addr:0x%x\n",&section_name[p_section->sh_name],p_section->sh_addr);
+		        user_stack_printk("%s find  sh_addr:0x%x\n",&section_name[p_section->sh_name],p_section->sh_addr);
 		    #endif
 		        elf_info->got_addr = (unsigned long *)p_section->sh_addr;
 		}
@@ -816,18 +827,18 @@ static int read_elf_section_info(struct file *elf_file,struct elf_file_info *elf
 			if(/*SHT_SYMTAB == p_section->sh_type && */strcmp(".symtab",&section_name[p_section->sh_name]) == 0)
 			{
                 #ifdef CONFIG_ARM64
-			        printk("%s find ,section sh_offset:0x%llx sh_size:0x%llx\n",&section_name[p_section->sh_name],p_section->sh_offset,p_section->sh_size);
+			        user_stack_printk("%s find ,section sh_offset:0x%llx sh_size:0x%llx\n",&section_name[p_section->sh_name],p_section->sh_offset,p_section->sh_size);
 		        #else
-			        printk("%s find ,section sh_offset:0x%x sh_size:0x%x\n",&section_name[p_section->sh_name],p_section->sh_offset,p_section->sh_size);
+			        user_stack_printk("%s find ,section sh_offset:0x%x sh_size:0x%x\n",&section_name[p_section->sh_name],p_section->sh_offset,p_section->sh_size);
 		        #endif 
                 memcpy(&elf_info->section_symtab,p_section,sizeof(struct elf_shdr));//保存.symtab 段section结构
 			    elf_info->first_elf_sym = kmalloc(p_section->sh_size,GFP_KERNEL);//
 			    if(!elf_info->first_elf_sym)
                     goto err;
-			    //从.symtab段指定的文件偏移地址读取.symtab段的数据到 elf_info->first_elf_sym,，这些数据就是struct elf_sym结构的集合，每一个struct elf32_sym结构代表一个函数信息，包括该库函数名字符串索引、库函数默认运行地址、库函数指令字节数
+			    //从.symtab段指定的文件偏移地址读取.symtab段的数据到 elf_info->first_elf_sym,，这些数据就是struct elf_sym结构的集合，每一个struct elf_sym结构代表一个函数信息，包括该函数名字符串索引、函数默认运行地址、函数指令字节数
                 retval = kernel_read(elf_file,p_section->sh_offset,(unsigned char *)elf_info->first_elf_sym,p_section->sh_size);
 				if (retval <= 0) {
-				    printk("%s line:%d kernel_read fail d\n",__func__,__LINE__);
+				    user_stack_printk("%s line:%d kernel_read fail d\n",__func__,__LINE__);
 					retval = -EIO;
 					goto err;
 				}			       
@@ -836,9 +847,9 @@ static int read_elf_section_info(struct file *elf_file,struct elf_file_info *elf
 			else if(/*SHT_STRTAB == p_section->sh_type && */strcmp(".strtab",&section_name[p_section->sh_name]) == 0)
 			{
 		        #ifdef CONFIG_ARM64
-			        printk("%s find ,section sh_offset:0x%llx sh_size:0x%llx\n",&section_name[p_section->sh_name],p_section->sh_offset,p_section->sh_size);
+			        user_stack_printk("%s find ,section sh_offset:0x%llx sh_size:0x%llx\n",&section_name[p_section->sh_name],p_section->sh_offset,p_section->sh_size);
 		        #else
-			        printk("%s find ,section sh_offset:0x%x sh_size:0x%x\n",&section_name[p_section->sh_name],p_section->sh_offset,p_section->sh_size);
+			        user_stack_printk("%s find ,section sh_offset:0x%x sh_size:0x%x\n",&section_name[p_section->sh_name],p_section->sh_offset,p_section->sh_size);
 		        #endif
 			    elf_info->elf_fun_str = kmalloc(p_section->sh_size,GFP_KERNEL);//
 			    if(!elf_info->elf_fun_str)
@@ -846,7 +857,7 @@ static int read_elf_section_info(struct file *elf_file,struct elf_file_info *elf
 			    //从.strtab段指定的文件偏移地址读取函数字符串数据到 elf_info->elf_fun_str
                 retval = kernel_read(elf_file,p_section->sh_offset,elf_info->elf_fun_str,p_section->sh_size);
 				if (retval <= 0) {
-			        printk("%s line:%d kernel_read fail d\n",__func__,__LINE__);
+			        user_stack_printk("%s line:%d kernel_read fail d\n",__func__,__LINE__);
 					retval = -EIO;
 					goto err;
 				}
@@ -889,7 +900,7 @@ static int get_lib_fun_offset(struct elf_file_info *elf_info,struct elf_file_inf
     
 	if(elf_info->elf_lib_fun_off)
 	{
-	    printk(KERN_DEBUG"%s  elf_lib_fun_off already ok\n",__func__);
+	    user_stack_printk(KERN_DEBUG"%s  elf_lib_fun_off already ok\n",__func__);
 		return 0;
 	}
 
@@ -907,43 +918,46 @@ static int get_lib_fun_offset(struct elf_file_info *elf_info,struct elf_file_inf
     lib_sym = (struct elf_sym *)lib_info->first_lib_sym;
     lib_fun_name = (char *)lib_info->elf_lib_fun_str;
 
-    //elf_info->section_dynsym.sh_size 是elf库文件.dynsym段总大小，除以struct elf_sym大小，就是库函数总数，一个函数信息用一个struct elf_sym结构表示
-    for(i = 0;i < elf_info->section_dynsym.sh_size/sizeof(struct elf_sym);i++)
+//调试可执行程序用到的库函数	
+#if 0
+	//elf_info->section_dynsym.sh_size 是elf库文件.dynsym段总大小，除以struct elf_sym大小，就是库函数总数，一个函数信息用一个struct elf_sym结构表示
+	for(i = 0;i < elf_info->section_dynsym.sh_size/sizeof(struct elf_sym);i++)
 	{
-        //从用户空间的got段内存复制库函数的首地址到got_lib_fun_val，这个地址是重定向后的地址，真实的库函数指令首地址
-	    if(get_user(got_lib_fun_val,p_got_lib_fun))
-	    {
-	        printk(KERN_ERR"%s get_user error  0x%p\n",__func__,p_got_lib_fun);
-	        return -EFAULT;
-	    }
-		printk(KERN_DEBUG"   %s got_lib_fun_val:0x%lx p_got_lib_fun:0x%p %s\n",__func__,got_lib_fun_val,p_got_lib_fun,&elf_lib_fun_name[elf_lib_sym->st_name]);
-
-#ifdef CONFIG_MIPS
-		if((got_lib_fun_val > 0x70000000) && (STT_FUNC == ELF_ST_TYPE(elf_lib_sym->st_info)))
-#elif defined CONFIG_ARM64
-//加上STT_FUNC限制，必须是func类型，测试发现_ITM_deregisterTMCIoneTab函数干扰，但是他的属性是NOTYPE，他也是.dynsym段的成员
-		if((got_lib_fun_val > 0x7000000000) && (STT_FUNC == ELF_ST_TYPE(elf_lib_sym->st_info)))
-#else
-   #error "not support !!!!!"
-#endif
+		//从用户空间的got段内存复制库函数的首地址到got_lib_fun_val，这个地址是重定向后的地址，真实的库函数指令首地址
+		if(get_user(got_lib_fun_val,p_got_lib_fun))
 		{
-		    printk(KERN_DEBUG"!!!%s elf_info find %s got_lib_fun_val:0x%lx p_got_lib_fun:0x%p\n",__func__,&elf_lib_fun_name[elf_lib_sym->st_name],got_lib_fun_val,p_got_lib_fun);
-			//指向.plt.got区下一片内存地址，.plt.got区的内存地址，amr64从第四片内存开始，都是库函数的运行地址，假设所有库函数都运行过了。而可执行程序文件的.dynsym区除了库函数，还有NOTIFY属性的干扰。所以elf_lib_sym++每次都执行，p_got_lib_fun++只有是有效库函数时才执行。
-		    //p_got_lib_fun++;//指向下一个库函数首指令地址所在内存
+			printk(KERN_ERR"%s get_user error  0x%p\n",__func__,p_got_lib_fun);
+			return -EFAULT;
 		}
-		if(STT_FUNC == ELF_ST_TYPE(elf_lib_sym->st_info))
-			p_got_lib_fun++;//指向下一个库函数首指令地址所在内存
+		user_stack_printk(KERN_DEBUG"   %s got_lib_fun_val:0x%lx p_got_lib_fun:0x%p %s\n",__func__,got_lib_fun_val,p_got_lib_fun,&elf_lib_fun_name[elf_lib_sym->st_name]);
 
-		elf_lib_sym ++;//指向像一个库函数 struct elf_sym 结构
+	#ifdef CONFIG_MIPS
+			if((got_lib_fun_val > 0x70000000) && (STT_FUNC == ELF_ST_TYPE(elf_lib_sym->st_info)))
+	#elif defined CONFIG_ARM64
+	//加上STT_FUNC限制，必须是func类型，测试发现_ITM_deregisterTMCIoneTab函数干扰，但是他的属性是NOTYPE，他也是.dynsym段的成员
+			if((got_lib_fun_val > 0x7000000000) && (STT_FUNC == ELF_ST_TYPE(elf_lib_sym->st_info)))
+	#else
+	   #error "not support !!!!!"
+	#endif
+			{
+				user_stack_printk(KERN_DEBUG"!!!%s elf_info find %s got_lib_fun_val:0x%lx p_got_lib_fun:0x%p\n",__func__,&elf_lib_fun_name[elf_lib_sym->st_name],got_lib_fun_val,p_got_lib_fun);
+				//指向.plt.got区下一片内存地址，.plt.got区的内存地址，amr64从第四片内存开始，都是库函数的运行地址，假设所有库函数都运行过了。而可执行程序文件的.dynsym区除了库函数，还有NOTIFY属性的干扰。所以elf_lib_sym++每次都执行，p_got_lib_fun++只有是有效库函数时才执行。
+				//p_got_lib_fun++;//指向下一个库函数首指令地址所在内存
+			}
+			if(STT_FUNC == ELF_ST_TYPE(elf_lib_sym->st_info))
+				p_got_lib_fun++;//指向下一个库函数首指令地址所在内存
+
+			elf_lib_sym ++;//指向像一个库函数 struct elf_sym 结构
 	}
-	
+		
 	elf_lib_sym = (struct elf_sym*)elf_info->first_lib_sym;
 	elf_lib_fun_name = (char *)elf_info->elf_lib_fun_str;
-    p_got_lib_fun = (unsigned long *)elf_info->got_addr;//这个是用户态的地址，要用get_user复制数据
-#ifdef CONFIG_MIPS	
-    p_got_lib_fun += 2;
-#else 
-    p_got_lib_fun += 3;
+	p_got_lib_fun = (unsigned long *)elf_info->got_addr;//这个是用户态的地址，要用get_user复制数据
+	#ifdef CONFIG_MIPS	
+		p_got_lib_fun += 2;
+	#else 
+		p_got_lib_fun += 3;
+	#endif
 #endif
 
     //elf_info->section_dynsym.sh_size 是elf库文件.dynsym段总大小，除以struct elf_sym大小，就是库函数总数，一个函数信息用一个struct elf_sym结构表示
@@ -965,7 +979,7 @@ static int get_lib_fun_offset(struct elf_file_info *elf_info,struct elf_file_inf
    #error "not support !!!!!"
 #endif
 		{
-		    printk(KERN_DEBUG"%s elf_info find %s got_lib_fun_val:0x%lx\n",__func__,&elf_lib_fun_name[elf_lib_sym->st_name],got_lib_fun_val);
+		    user_stack_printk(KERN_DEBUG"%s elf_info find %s got_lib_fun_val:0x%lx\n",__func__,&elf_lib_fun_name[elf_lib_sym->st_name],got_lib_fun_val);
 			//p_got_lib_fun++;//指向下一个库函数首指令地址所在内存
 			break;
 		}
@@ -980,8 +994,8 @@ static int get_lib_fun_offset(struct elf_file_info *elf_info,struct elf_file_inf
 	//运行指令首地址，&elf_lib_fun_name[elf_lib_sym->st_name]就是该库函名字符串
 
 	/*在库文件中的.dynstr段和.dynsym段分析与 &elf_lib_fun_name[elf_lib_sym->st_name] 库函数名字字符串一致的
-	库函数，找到它的struct elf_sym *lib_sym结构，取出它的st_value就是库函数的原始地址，与got_lib_fun_val的
-	差值就是库函数的运行地址与原始地址的偏差*/
+	库函数，找到它的struct elf_sym *lib_sym结构，取出它的st_value就是库函数的原始首地址，与got_lib_fun_val的
+	差值就是库函数的运行首地址与原始首地址的偏差*/
 
 	for(i = 0;i < lib_info->section_dynsym.sh_size/sizeof(struct elf_sym);i++)
 	{
@@ -990,9 +1004,9 @@ static int get_lib_fun_offset(struct elf_file_info *elf_info,struct elf_file_inf
 		    elf_info->elf_lib_fun_off = got_lib_fun_val - lib_sym->st_value;
 
 		#ifdef CONFIG_ARM64
-		    printk(KERN_DEBUG"%s lib_info find %s st_value:0x%llx elf_lib_fun_off:0x%lx\n",__func__,&lib_fun_name[lib_sym->st_name],lib_sym->st_value,elf_info->elf_lib_fun_off);
+		    user_stack_printk(KERN_DEBUG"%s lib_info find %s st_value:0x%llx elf_lib_fun_off:0x%lx\n",__func__,&lib_fun_name[lib_sym->st_name],lib_sym->st_value,elf_info->elf_lib_fun_off);
 		#else
-		    printk(KERN_DEBUG"%s lib_info find %s st_value:0x%x elf_lib_fun_off:0x%lx\n",__func__,&lib_fun_name[lib_sym->st_name],lib_sym->st_value,elf_info->elf_lib_fun_off);
+		    user_stack_printk(KERN_DEBUG"%s lib_info find %s st_value:0x%x elf_lib_fun_off:0x%lx\n",__func__,&lib_fun_name[lib_sym->st_name],lib_sym->st_value,elf_info->elf_lib_fun_off);
 		#endif
 		 
             ret =0;
@@ -1003,7 +1017,7 @@ static int get_lib_fun_offset(struct elf_file_info *elf_info,struct elf_file_inf
 	}
 
     if(0 != ret)
-	    printk("%s cat not find match lib fun name from elf_lib_sym\n",__func__);
+	    user_stack_printk("%s cat not find match lib fun name from elf_lib_sym\n",__func__);
 	return ret;
 }
 /** get_lib_fun_info - 根据addr计算出它所处于的库函数的名字、函数运行首地址、函数运行结束地址
@@ -1032,16 +1046,16 @@ static int get_lib_fun_info(struct sym_fun_info * sym_lib_info,struct elf_file_i
         //lib_sym->st_value 是lib库文件中每个库函数的默认函数首地址，lib_sym->st_value + lib_fun_offset 是库函数重定向后的函数首地址
 	    if((addr >= lib_sym->st_value + lib_fun_offset) && (addr < lib_sym->st_value + lib_fun_offset + lib_sym->st_size))
 		{
-		    //lib_fun_name 是库函数名字字符串首地址，elf_lib_sym->st_name是当前函数名字字符串在lib_fun_name数组的索引
+		    //lib_fun_name 是库函数名字字符串集合首地址，elf_lib_sym->st_name是当前函数名字字符串在lib_fun_name数组的索引
 		    strncpy(sym_lib_info->name,&lib_fun_name[lib_sym->st_name],FUN_NAME_LEN);
             sym_lib_info->fun_first_instruct_addr = lib_sym->st_value + lib_fun_offset;//库函数指令首地址
 			sym_lib_info->fun_end_instruct_addr = lib_sym->st_value + lib_fun_offset + lib_sym->st_size;//库函数指令结束地址
             memcpy(&user_stack_unwind_info.sym_info,sym_lib_info,sizeof(struct sym_fun_info));
 
       #ifdef CONFIG_ARM64
-			printk(KERN_DEBUG"%s find %s first_fun_addr:0x%lx size:0x%llx  st_value:0x%llx\n",__func__,sym_lib_info->name,sym_lib_info->fun_first_instruct_addr,lib_sym->st_size,lib_sym->st_value);
+			user_stack_printk(KERN_DEBUG"%s find %s first_fun_addr:0x%lx size:0x%llx  st_value:0x%llx\n",__func__,sym_lib_info->name,sym_lib_info->fun_first_instruct_addr,lib_sym->st_size,lib_sym->st_value);
 	  #else		
-			printk(KERN_DEBUG"%s find %s first_fun_addr:0x%lx size:0x%x  st_value:0x%x\n",__func__,sym_lib_info->name,sym_lib_info->fun_first_instruct_addr,lib_sym->st_size,lib_sym->st_value);
+			user_stack_printk(KERN_DEBUG"%s find %s first_fun_addr:0x%lx size:0x%x  st_value:0x%x\n",__func__,sym_lib_info->name,sym_lib_info->fun_first_instruct_addr,lib_sym->st_size,lib_sym->st_value);
 	  #endif
 	        /*测试证实，double free栈回溯时，第一级函数是gsignal或者raise，这两个函数的st_value和st_size完全一样，就是两个不同的函数
 			名字，但是对应同一个函数。但是gsignal会先搜索到，gdb此时栈回溯时打印的是raise函数，所以这里就不直接return 0，而是一直搜索，
@@ -1073,38 +1087,38 @@ static int get_elf_fun_info(struct sym_fun_info * elf_sym_info,struct elf_file_i
 	elf_fun_sym = (struct elf_sym*)elf_info->first_elf_sym;
     elf_fun_name = (char *)elf_info->elf_fun_str;
 
-    //elf_info->section_dynsym.sh_size 是elf库文件.dynsym段总大小，除以struct elf_sym大小，就是库函数总数，一个函数信息用一个struct elf_sym结构表示
+    //elf_info->section_dynsym.sh_size 是elf文件.dynsym段总大小，除以struct elf_sym大小，就是函数总数，一个函数信息用一个struct elf_sym结构表示
     for(i = 0;i < elf_info->section_symtab.sh_size/sizeof(struct elf_sym);i++)
 	{
-        //elf_fun_sym->st_value 是lib库文件中每个库函数的默认函数首地址，elf_fun_sym->st_value + lib_fun_offset 是库函数重定向后的函数首地址
+        //elf_fun_sym->st_value 是可执行程序文件中每个函数的函数首地址
 	    if((addr >= elf_fun_sym->st_value) && (addr < elf_fun_sym->st_value + elf_fun_sym->st_size))
 		{
-		    //elf_fun_name 是库函数名字字符串首地址，elf_lib_sym->st_name是当前函数名字字符串在lib_fun_name数组的索引
+		    //elf_fun_name 是函数名字字符串集合首地址，elf_lib_sym->st_name是当前函数名字字符串在lib_fun_name数组的索引
 		    strncpy(elf_sym_info->name,&elf_fun_name[elf_fun_sym->st_name],FUN_NAME_LEN);
-            elf_sym_info->fun_first_instruct_addr = elf_fun_sym->st_value;//库函数指令首地址
-			elf_sym_info->fun_end_instruct_addr = elf_fun_sym->st_value + elf_fun_sym->st_size;//库函数指令结束地址
+            elf_sym_info->fun_first_instruct_addr = elf_fun_sym->st_value;//函数指令首地址
+			elf_sym_info->fun_end_instruct_addr = elf_fun_sym->st_value + elf_fun_sym->st_size;//函数指令结束地址
             memcpy(&user_stack_unwind_info.sym_info,elf_sym_info,sizeof(struct sym_fun_info));
 
       #ifdef CONFIG_ARM64
-			printk(KERN_DEBUG"%s find %s first_fun_addr:0x%lx size:0x%llx  st_value:0x%llx\n",__func__,elf_sym_info->name,elf_sym_info->fun_first_instruct_addr,elf_fun_sym->st_size,elf_fun_sym->st_value);
+			user_stack_printk(KERN_DEBUG"%s find %s first_fun_addr:0x%lx size:0x%llx  st_value:0x%llx\n",__func__,elf_sym_info->name,elf_sym_info->fun_first_instruct_addr,elf_fun_sym->st_size,elf_fun_sym->st_value);
 	  #else		
-			printk(KERN_DEBUG"%s find %s first_fun_addr:0x%lx size:0x%x  st_value:0x%x\n",__func__,elf_sym_info->name,elf_sym_info->fun_first_instruct_addr,elf_fun_sym->st_size,elf_fun_sym->st_value);
+			user_stack_printk(KERN_DEBUG"%s find %s first_fun_addr:0x%lx size:0x%x  st_value:0x%x\n",__func__,elf_sym_info->name,elf_sym_info->fun_first_instruct_addr,elf_fun_sym->st_size,elf_fun_sym->st_value);
 	  #endif
 	        ret = 0;
             //return 0;
         }
 
-		elf_fun_sym ++;//指向下一个库函数struct elf_sym结构
+		elf_fun_sym ++;//指向下一个函数struct elf_sym结构
 	}
 	return ret;
 }
-/** get_elflib_path_file_name - 根据传入的addr这个某个库函数指令地址计算出属于哪个库文件的
+/** get_elflib_path_file_name - 根据传入的addr这个某个库函数指令地址计算出属于哪个库文件
 * @task - 当前栈回溯进程
 * @addr - 与栈回溯有关的某个库函数指令地址
 *
 * returns：
 *     NULL:没有找到与addr构成文件映射的库文件
-*     其他:与addr构成文件映射的库文件名字字符串
+*     其他:与addr所在内存构成文件映射的库文件名字字符串
 */
 static char *get_elflib_path_file_name(struct task_struct *task,unsigned long addr)
 {
@@ -1197,6 +1211,8 @@ int user_stack_backstrace(struct pt_regs *regs,struct task_struct *task)
 
     printk(KERN_ALERT"user thread:%s  pid:%d  stack strace\n",current->comm,current->pid);
     
+	//mutex_init(&user_stack_unwind_info.stack_backstrace_lock);
+	
     strncpy(elf_path_name,get_elf_path_file(current,&text_start,&text_end),sizeof(elf_path_name));
 	if(elf_path_name[0] == '\0')
 	{
@@ -1204,7 +1220,7 @@ int user_stack_backstrace(struct pt_regs *regs,struct task_struct *task)
 		retval = -ENOEXEC;
 	    goto err;
 	}
-
+    
 	memset(&user_stack_unwind_info,0,sizeof(struct user_stack_unwind));
 	memset(&elf_info,0,sizeof(struct elf_file_info));
 	memset(&lib_info,0,sizeof(struct elf_file_info));
@@ -1214,7 +1230,7 @@ int user_stack_backstrace(struct pt_regs *regs,struct task_struct *task)
     user_stack_unwind_info.elf_text_end   = text_end;
     user_stack_unwind_info.thread_stack_start = task->mm->start_stack;
     user_stack_unwind_info.thread = task;
-
+    
     oldfs = get_fs();
 	set_fs(KERNEL_DS);
 
@@ -1266,6 +1282,7 @@ int user_stack_backstrace(struct pt_regs *regs,struct task_struct *task)
 	show_user_backtrace(current,regs);
 	
 	retval = 0;
+	
 err:
 	
 	if(elf_info.first_lib_sym)
