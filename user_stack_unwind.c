@@ -873,7 +873,9 @@ static int read_elf_section_info(struct file *elf_file,struct elf_file_info *elf
     retval = 0;
 err:
     if(section_data)
-		kfree(section_data);
+        kfree(section_data);
+    if(section_name)
+	kfree(section_name);
     return retval;
 }
 /** get_lib_fun_offset - 计算库函数的实际运行首地址和原始首地址之差保存到 elf_info->elf_lib_fun_off
