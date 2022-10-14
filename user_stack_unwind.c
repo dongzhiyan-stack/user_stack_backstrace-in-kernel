@@ -713,7 +713,7 @@ static int read_elf_section_info(struct file *elf_file,struct elf_file_info *elf
 {
    // struct elf_shdr *section_head;
 	struct elf_shdr *p_section = NULL;
-	char *section_name;
+	char *section_name = NULL;
 	int i;
 	long retval;
     struct elfhdr elf_head;
